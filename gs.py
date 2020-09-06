@@ -16,6 +16,11 @@ from models.models import Generator, Discriminator
 from utils.utils import *
 from utils.perceptual import *
 from datasets.datasets import ImageDataset, PairedImageDataset
+from torch.quantization.observer import *
+from torch.quantization.fake_quantize import *
+from torch.quantization.qconfig import *
+from torch.quantization import prepare_qat
+from utils.quant import *
 
 
 parser = argparse.ArgumentParser()
@@ -37,6 +42,14 @@ parser.add_argument('--beta', type=float, default=0.001, help='GAN loss weight')
 parser.add_argument('--lc', default='vgg', choices=['vgg', 'mse'], help='G content loss. vgg: perceptual; mse: mse')
 parser.add_argument('--quant', action='store_true', help='enable quantization (for both activation and weight)')
 parser.add_argument('--resume', action='store_true', help='If true, resume from early stopped ckpt')
+parser.add_argument('--finetune_qat', action='store_true', help='Perform qat starting from checkpoint weights')
+parser.add_argument('--freeze_stats', type=int, default=7, help='epoch to freeze observers statistics')
+parser.add_argument('--weights', type=str, default=None, help='path to pretrained weights')
+parser.add_argument('--show_pic', type=int, default=10, help='save pictures every x epochs')
+parser.add_argument('--reduce_act', action='store_true', help='reduce activations bits')
+parser.add_argument('--reduce_w', action='store_true', help='reduce weights bits')
+parser.add_argument('--q', type=float, default=0.99, help='quantile for observer')
+
 args = parser.parse_args()
 if args.task == 'A2B':
     source_str, target_str = 'A', 'B'
@@ -64,7 +77,33 @@ create_dir(img_dir), create_dir(pth_dir)
 
 ## Networks
 # G:
-netG = Generator(args.input_nc, args.output_nc, quant=args.quant).cuda()
+
+if (args.finetune_qat):
+    from models.models_pytorch_comp import Generator
+    netG = Generator(args.input_nc, args.output_nc).cuda()
+    assert args.weights != None
+    model_dict = netG.state_dict()
+    model_dict.update(torch.load(args.weights))
+    netG.load_state_dict(model_dict)
+    weight_quant = FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver,
+                                                           quant_min=-128,
+                                                           quant_max=127,
+                                                           dtype=torch.qint8,
+                                                           qscheme=torch.per_channel_symmetric,
+                                                           reduce_range=args.reduce_w,
+                                                           ch_axis=0)
+    act_quant = FakeQuantize.with_args(observer=MovingAverageQuantileObserver,
+                                                        quant_min=0,
+                                                        quant_max=255,
+                                                        **{'reduce_range': 7 if args.reduce_act else 8,
+                                                         'q_min':0,
+                                                         'q_max':args.q})
+    
+    netG.qconfig = QConfig(activation=act_quant,
+                           weight=weight_quant)
+    torch.quantization.prepare_qat(netG, inplace=True)
+else:    
+    netG = Generator(args.input_nc, args.output_nc, quant=args.quant).cuda()
 # D:
 netD = Discriminator(args.input_nc).cuda()
 
@@ -123,9 +162,38 @@ fake_img_buffer = ReplayBuffer()
 # perceptual loss models:
 vgg = VGGFeature().cuda()
 
+# initial calibration and baseline results
+if (args.finetune_qat):
+    for i, batch in enumerate(dataloader):
+        netG.cuda()
+        if (i > 30):
+            break
+        input_img = Variable(input_source.copy_(batch[source_str])) # X 
+        teacher_output_img = Variable(input_target.copy_(batch[target_str]))
+        with torch.no_grad():
+            student_output_img = netG(input_img)
+            
+    quantized_model = torch.quantization.convert(netG.cpu(), inplace=False)
+    quantized_model.eval()
+    with torch.no_grad():
+        student_output_img = quantized_model(input_img.cpu())
+    # save imgs:
+    epoch = 0
+    images={'input_img': input_img, 'teacher_output_img': teacher_output_img, 'student_output_img': student_output_img}
+    for key in images:
+        img_np = images[key].detach().cpu().numpy()
+        img_np = np.moveaxis(img_np, 1, -1)
+        img_np = (img_np + 1) / 2 # (-1,1) -> (0,1)
+        img_big = fourD2threeD(img_np, n_row=1)
+        print(key, img_big.shape, np.amax(img_big), np.amin(img_big))
+        imsave(os.path.join(img_dir, 'epoch%d_%s.png' % (epoch, key)), img_as_ubyte(img_big))
+        
+     
 ###### Training ######
 print('dataloader:', len(dataloader)) # 1334
 for epoch in range(start_epoch, args.epochs):
+    epoch += 1
+    netG.cuda()
     start_time = time.time()
     netG.train(), netD.train()
     # define average meters:
@@ -233,14 +301,20 @@ for epoch in range(start_epoch, args.epochs):
         plt.savefig(os.path.join(results_dir, '%s.png' % key))
         plt.close()
 
-    if epoch % 10 == 0 or epoch == args.epochs - 1:
+    if epoch % args.show_pic == 0 or epoch == args.epochs - 1:
+        if (args.finetune_qat):
+            # convert model
+            quantized_model = torch.quantization.convert(netG.cpu(), inplace=False)
+            quantized_model.eval()
+            with torch.no_grad():
+                student_output_img = quantized_model(input_img.cpu())
         # save imgs:
         images={'input_img': input_img, 'teacher_output_img': teacher_output_img, 'student_output_img': student_output_img}
         for key in images:
             img_np = images[key].detach().cpu().numpy()
             img_np = np.moveaxis(img_np, 1, -1)
             img_np = (img_np + 1) / 2 # (-1,1) -> (0,1)
-            img_big = fourD2threeD(img_np, n_row=4)
+            img_big = fourD2threeD(img_np, n_row=1)
             print(key, img_big.shape, np.amax(img_big), np.amin(img_big))
             imsave(os.path.join(img_dir, 'epoch%d_%s.png' % (epoch, key)), img_as_ubyte(img_big))
 
@@ -262,4 +336,7 @@ for epoch in range(start_epoch, args.epochs):
         lr_scheduler_G, lr_scheduler_D, lr_scheduler_gamma,
         loss_G_lst, loss_G_perceptual_lst, loss_G_GAN_lst, loss_D_lst, channel_number_lst, 
         path=os.path.join(pth_dir, 'latest.pth'))
+    
+    if args.finetune_qat and epoch == args.freeze_stats:
+        netG.apply(torch.quantization.disable_observer)
 ###### End Training ######

@@ -42,13 +42,13 @@ class PairedImageDataset(Dataset):
         if mode in ['A2B']:
             path_A = os.path.join(dataset_dir, 'train', 'A')
             path_B = os.path.join(soft_data_dir, 'B')
-            self.files_A = sorted(glob.glob(path_A + '/*.jpg'))
+            self.files_A = sorted(glob.glob(path_A + '/*.png'))
             self.files_B = sorted(glob.glob(path_B + '/*.png'))
         else:
             path_A = os.path.join(soft_data_dir, 'A')
             path_B = os.path.join(dataset_dir, 'train', 'B')
             self.files_A = sorted(glob.glob(path_A + '/*.png'))
-            self.files_B = sorted(glob.glob(path_B + '/*.jpg'))
+            self.files_B = sorted(glob.glob(path_B + '/*.png'))
         print('files_A:', len(self.files_A))
         print('files_B:', len(self.files_B))
         assert len(self.files_A) == len(self.files_B)
